@@ -1,0 +1,17 @@
+# Modern, fully free stack for v1.py.
+# Tested with Python 3.14 on macOS (arm64); requires Python 3.11+ because
+# Streamlit 1.67 does.
+#
+# Notes
+# -----
+# * mediapipe>=1.2 only ships the Tasks API. The legacy `mp.solutions` module
+#   was removed in 0.10.31, which is why the old streamlit_app.py fails.
+# * opencv-contrib-python is a superset of opencv-python and is also required
+#   by mediapipe. Do not install both opencv-python and opencv-contrib-python.
+# * av bundles FFmpeg with libx264, so H.264 encoding and audio muxing work
+#   without a system ffmpeg install.
+streamlit
+mediapipe
+opencv-contrib-python
+av
+numpy
