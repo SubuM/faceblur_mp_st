@@ -8,11 +8,22 @@ and settings code. In image mode the background can optionally be removed
 background keeps its native aspect ratio and the subject is scaled and placed to
 match it.
 
-The new face-morph flow takes a source and a target image, finds the largest
-face in each with MediaPipe's FaceLandmarker, aligns the target face onto the
-source face, and blends the two with a Delaunay-triangulated piecewise warp. It
-can blend only the face or the whole aligned image, and the morph amount is
-adjustable from 0% (source) to 100% (target).
+The face-morph flow takes a source and a target image, finds the largest
+face in each and determines its ROI in a roll-normalised frame (a tilted head
+reports the same ROI as an upright one). The whole target image is resized
+with a single uniform scale so its face ROI matches the source's in pixel
+size, then the target face is placed *exactly* on the source face's footprint
+— same size, position and tilt, anchored on the eye midpoint — so the mixed
+face replaces the source face proportionately instead of being overlaid at a
+compromise position. Both faces are warped to an intermediate shape with a
+Delaunay-triangulated piecewise warp. The two warped faces are
+cross-dissolved into a single mixed face — with the target's skin tone
+matched to the source — and placed back on the source image inside a
+feathered face oval, so the source framing and background are preserved. The
+face can be located by MediaPipe's FaceLandmarker in one pass or by YuNet
+first when the face is small in its photo, and the morph amount is
+adjustable from 0% (source) to 100% (target). The blend can cover the face
+only or the whole image.
 
 The original app relied on APIs that no longer exist in the current, free
 package releases:
@@ -157,6 +168,11 @@ DETECTOR_LANDMARKER = "MediaPipe FaceLandmarker"
 
 MORPH_FACE_ONLY = "Face only"
 MORPH_WHOLE_IMAGE = "Whole image"
+
+# How the face is located before the landmark mesh is fitted. The mesh itself
+# always comes from MediaPipe; YuNet only steers where to look.
+MORPH_FINDER_MEDIAPIPE = DETECTOR_LANDMARKER
+MORPH_FINDER_YUNET = "YuNet (finds the face first)"
 
 BLUR_GAUSSIAN = "Gaussian blur"
 BLUR_PIXELATE = "Pixelate"
@@ -1359,22 +1375,48 @@ FACE_OVAL_INDICES = (
     172, 58, 132, 93, 234, 127, 162, 21, 54, 103, 67, 109,
 )
 
+# Iris centres (points 468-477 of the 478-point mesh) and the outer eye
+# corners. They barely move with facial expression, so they anchor the
+# roll-normalised face frame that the ROI size, the proportionate resize
+# factor and the exact face placement are all derived from.
+RIGHT_IRIS_INDEX = 468
+LEFT_IRIS_INDEX = 473
+EYE_CORNER_INDICES = (33, 133, 362, 263)
+
 
 class FaceLandmarkerModel:
     """MediaPipe Tasks FaceLandmarker, used to find one face per image.
 
     The task returns a 478-point mesh (468 face points plus iris points). Only
-    the largest face is used, so group photos still produce a predictable morph.
+    the largest face is used, so group photos still produce a predictable
+    morph. Two finders can steer where the mesh is fitted:
+
+    - ``MORPH_FINDER_MEDIAPIPE`` (default): the landmarker's own detector
+      finds the face in one pass and is the most accurate when the face fills
+      a fair share of the frame.
+    - ``MORPH_FINDER_YUNET``: YuNet locates the face box first and the mesh
+      is fitted on a crop normalised around it, which keeps working when the
+      face is small relative to its photo.
+
+    Whichever finder is chosen, the other one is tried as a fallback, so a
+    borderline photo still yields landmarks whenever either detector can see
+    the face.
     """
 
     name = DETECTOR_LANDMARKER
 
-    def __init__(self, model_path: Path) -> None:
+    def __init__(
+        self, model_path: Path, finder: str = MORPH_FINDER_MEDIAPIPE
+    ) -> None:
         import mediapipe as mp
         from mediapipe.tasks import python as mp_python
         from mediapipe.tasks.python import vision as mp_vision
 
         self._mp = mp
+        self.finder = (
+            finder if finder in (MORPH_FINDER_MEDIAPIPE, MORPH_FINDER_YUNET)
+            else MORPH_FINDER_MEDIAPIPE
+        )
         self._landmarker = mp_vision.FaceLandmarker.create_from_options(
             mp_vision.FaceLandmarkerOptions(
                 base_options=mp_python.BaseOptions(model_asset_path=str(model_path)),
@@ -1385,6 +1427,19 @@ class FaceLandmarkerModel:
 
     def largest_face(self, image_bgr: np.ndarray, label: str = "image") -> np.ndarray:
         """Return pixel-space landmarks for the largest face in ``image_bgr``."""
+        if self.finder == MORPH_FINDER_YUNET:
+            points = self._landmark_via_yunet(image_bgr, label)
+            if points is not None:
+                return points
+        try:
+            return self._detect_largest(image_bgr, label)
+        except RuntimeError:
+            points = self._landmark_via_yunet(image_bgr, label)
+            if points is not None:
+                return points
+            raise
+
+    def _detect_largest(self, image_bgr: np.ndarray, label: str) -> np.ndarray:
         height, width = image_bgr.shape[:2]
         rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
         mp_image = self._mp.Image(
@@ -1410,6 +1465,69 @@ class FaceLandmarkerModel:
             )
         return points
 
+    def _landmark_via_yunet(
+        self, image_bgr: np.ndarray, label: str
+    ) -> np.ndarray | None:
+        """Locate the face with YuNet, then fit the mesh on a normalised crop.
+
+        YuNet is a multi-scale sliding-window detector, so it finds the face
+        box even when the face is small relative to its photo — exactly where
+        the landmarker's own detector gives up. A generous crop around that
+        box is rescaled so the face sits in the landmarker's detection sweet
+        spot, the mesh is fitted there, and the points are mapped back into
+        the original pixel space. Returns ``None`` when YuNet cannot find the
+        face either.
+        """
+        try:
+            model_path = ensure_model(YUNET_FILENAME, YUNET_URLS, YUNET_MIN_BYTES)
+            detector = YunetFaceDetector(
+                model_path, score_threshold=0.5, max_side=1920
+            )
+            try:
+                boxes = detector.detect(image_bgr)
+            finally:
+                detector.close()
+        except Exception:  # noqa: BLE001 - the caller keeps the original error
+            return None
+        if not boxes:
+            return None
+
+        box = max(boxes, key=lambda candidate: candidate.w * candidate.h)
+        height, width = image_bgr.shape[:2]
+        center_x = box.x + box.w / 2.0
+        center_y = box.y + box.h / 2.0
+        # Enough context that the face fills roughly a quarter of the crop,
+        # which is squarely inside the landmarker's detection sweet spot.
+        side = max(box.w, box.h) * 4.0
+        x0 = max(0, int(center_x - side * 0.5))
+        y0 = max(0, int(center_y - side * 0.5))
+        x1 = min(width, int(center_x + side * 0.5))
+        y1 = min(height, int(center_y + side * 0.5))
+        if x1 - x0 < 24 or y1 - y0 < 24:
+            return None
+
+        crop = image_bgr[y0:y1, x0:x1]
+        long_side = max(crop.shape[:2])
+        target_long_side = 900
+        interpolation = (
+            cv2.INTER_AREA if long_side > target_long_side else cv2.INTER_CUBIC
+        )
+        new_width = max(2, round(crop.shape[1] * target_long_side / long_side))
+        new_height = max(2, round(crop.shape[0] * target_long_side / long_side))
+        resized = cv2.resize(crop, (new_width, new_height), interpolation=interpolation)
+
+        try:
+            points = self._detect_largest(resized, label)
+        except RuntimeError:
+            return None
+
+        scale_x = new_width / float(x1 - x0)
+        scale_y = new_height / float(y1 - y0)
+        mapped = np.stack(
+            [points[:, 0] / scale_x + x0, points[:, 1] / scale_y + y0], axis=1
+        )
+        return mapped.astype(np.float32)
+
     def close(self) -> None:
         try:
             self._landmarker.close()
@@ -1417,13 +1535,16 @@ class FaceLandmarkerModel:
             pass
 
 
-def build_landmarker(progress: ProgressCallback | None = None) -> FaceLandmarkerModel:
+def build_landmarker(
+    progress: ProgressCallback | None = None,
+    finder: str = MORPH_FINDER_MEDIAPIPE,
+) -> FaceLandmarkerModel:
     """Create the face landmarker, downloading its model on first use."""
     if progress:
         progress(0.02, "Loading face landmark model…")
     model_path = ensure_model(LANDMARKER_FILENAME, LANDMARKER_URLS, LANDMARKER_MIN_BYTES)
     try:
-        return FaceLandmarkerModel(model_path)
+        return FaceLandmarkerModel(model_path, finder=finder)
     except ImportError as exc:
         raise RuntimeError(
             "MediaPipe is not installed. Run `pip install -r requirements-v1.txt`."
@@ -1466,27 +1587,123 @@ def _transform_points(points: np.ndarray, matrix: np.ndarray) -> np.ndarray:
     return (homogeneous @ matrix.T).astype(np.float32)
 
 
+def _face_frame(points: np.ndarray) -> tuple[np.ndarray, float, float, float]:
+    """Roll-normalised anchor, angle, width and height of a face mesh.
+
+    The anchor is the midpoint between the eyes and the roll is the angle of
+    the eye line, so neither moves with facial expression. The width and
+    height are measured on the face oval *after* the roll is undone, which
+    makes the ROI rotation-invariant: a tilted head reports exactly the same
+    ROI size as an upright one. Every proportionate decision downstream —
+    the resize factor and the placement transform — is derived from this
+    frame.
+    """
+    if len(points) > LEFT_IRIS_INDEX:
+        right_eye = points[RIGHT_IRIS_INDEX]
+        left_eye = points[LEFT_IRIS_INDEX]
+    else:
+        # Meshes without iris points: the outer eye corners instead.
+        corners = points[list(EYE_CORNER_INDICES)]
+        right_eye = (corners[0] + corners[1]) / 2.0
+        left_eye = (corners[2] + corners[3]) / 2.0
+    anchor = (right_eye + left_eye) / 2.0
+    roll = float(np.arctan2(left_eye[1] - right_eye[1], left_eye[0] - right_eye[0]))
+
+    cos, sin = np.cos(-roll), np.sin(-roll)
+    oval = points[list(FACE_OVAL_INDICES)] - anchor
+    rotated = np.stack(
+        [oval[:, 0] * cos - oval[:, 1] * sin, oval[:, 0] * sin + oval[:, 1] * cos],
+        axis=1,
+    )
+    width = float(rotated[:, 0].max() - rotated[:, 0].min())
+    height = float(rotated[:, 1].max() - rotated[:, 1].min())
+    return anchor, roll, width, height
+
+
+def _roi_scale_ratio(
+    source_frame: tuple[np.ndarray, float, float, float],
+    target_frame: tuple[np.ndarray, float, float, float],
+) -> float:
+    """Uniform, proportionate resize factor between two face ROIs.
+
+    The mean of the width and height ratios keeps the resize a single uniform
+    scale — no stretching — matching the ROI as closely as one scale can.
+    """
+    (_, _, source_width, source_height), (_, _, target_width, target_height) = (
+        source_frame,
+        target_frame,
+    )
+    if target_width <= 1e-6 or target_height <= 1e-6:
+        return 1.0
+    ratio = (source_width / target_width + source_height / target_height) / 2.0
+    return float(ratio) if np.isfinite(ratio) and ratio > 1e-3 else 1.0
+
+
+def _roi_similarity(
+    source_frame: tuple[np.ndarray, float, float, float],
+    target_frame: tuple[np.ndarray, float, float, float],
+) -> np.ndarray:
+    """Exact similarity transform placing the target ROI on the source ROI.
+
+    Scale comes from the ROI size ratio, rotation from the eye-line angle
+    difference, and translation maps the target eye midpoint exactly onto the
+    source eye midpoint. Because the transform is derived directly from the
+    two ROIs instead of being least-squares fitted to landmarks, it is not a
+    compromise between conflicting points: the target face occupies precisely
+    the source face's footprint — same size, same position, same tilt — which
+    is what keeps the morph proportionate at every amount.
+    """
+    (source_anchor, source_roll, _, _), (target_anchor, target_roll, _, _) = (
+        source_frame,
+        target_frame,
+    )
+    scale = _roi_scale_ratio(source_frame, target_frame)
+    angle = source_roll - target_roll
+    a = scale * float(np.cos(angle))
+    b = -scale * float(np.sin(angle))
+    d = scale * float(np.sin(angle))
+    e = scale * float(np.cos(angle))
+    return np.array(
+        [
+            [a, b, source_anchor[0] - (a * target_anchor[0] + b * target_anchor[1])],
+            [d, e, source_anchor[1] - (d * target_anchor[0] + e * target_anchor[1])],
+        ],
+        np.float32,
+    )
+
+
+def _face_roi(
+    points: np.ndarray, image_shape: tuple[int, ...], margin: float = 0.15
+) -> tuple[int, int, int, int]:
+    """Bounding box of the face oval plus ``margin``, clamped to the image."""
+    oval = points[list(FACE_OVAL_INDICES)]
+    x_min, y_min = oval.min(axis=0)
+    x_max, y_max = oval.max(axis=0)
+    pad = margin * max(x_max - x_min, y_max - y_min)
+    height, width = image_shape[:2]
+    x0 = int(np.clip(np.floor(x_min - pad), 0, max(0, width - 2)))
+    y0 = int(np.clip(np.floor(y_min - pad), 0, max(0, height - 2)))
+    x1 = int(np.clip(np.ceil(x_max + pad), x0 + 1, width))
+    y1 = int(np.clip(np.ceil(y_max + pad), y0 + 1, height))
+    return x0, y0, x1, y1
+
+
 def _align_target(
     target: np.ndarray,
     target_points: np.ndarray,
     source_points: np.ndarray,
     source_shape: tuple[int, ...],
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Warp the target image so its face matches the source face.
+    """Place the target face exactly on the source face's ROI.
 
-    A similarity transform (uniform scale, rotation, translation) is enough for
-    normal portrait photos and avoids the shearing that a full affine fit can
-    introduce. ``LMEDS`` ignores the few landmarks that differ because of
-    expression or small pose changes.
+    The similarity transform comes straight from the two ROIs
+    (:func:`_roi_similarity`): a uniform scale from the ROI size ratio, the
+    tilt difference of the two eye lines, and an exact eye-midpoint anchor.
+    The target face therefore replaces the source face at the same size,
+    position and tilt — not at a least-squares compromise position — so the
+    morphed face stays proportionate to the source photo.
     """
-    matrix, _ = cv2.estimateAffinePartial2D(
-        target_points, source_points, method=cv2.LMEDS
-    )
-    if matrix is None:
-        raise RuntimeError(
-            "Could not align the two faces. Use two photos with a clearly visible "
-            "face and a similar head orientation."
-        )
+    matrix = _roi_similarity(_face_frame(source_points), _face_frame(target_points))
     height, width = source_shape[:2]
     aligned = cv2.warpAffine(
         target,
@@ -1578,8 +1795,12 @@ def _warp_piecewise(
     return output
 
 
-def _face_ring_points(points: np.ndarray, scale: float = 1.25) -> np.ndarray:
-    """Return a slightly expanded face-oval ring for warp coverage."""
+def _face_ring_points(points: np.ndarray, scale: float = 1.4) -> np.ndarray:
+    """Return an expanded face-oval ring for warp coverage.
+
+    The ring must reach beyond the feathered blend mask (the oval plus its
+    blur halo) so the mixed face is fully covered by warped pixels.
+    """
     oval = points[list(FACE_OVAL_INDICES)].astype(np.float32)
     center = oval.mean(axis=0, keepdims=True)
     return (center + (oval - center) * scale).astype(np.float32)
@@ -1603,16 +1824,111 @@ def _image_boundary_points(shape: tuple[int, ...]) -> np.ndarray:
 
 
 def _face_blend_mask(shape: tuple[int, ...], points: np.ndarray) -> np.ndarray:
-    """Feathered mask covering the morphed face oval."""
+    """Softly feathered mask covering the mixed face oval.
+
+    The feather is proportional to the face size (about a tenth of its
+    width), not to the image size, so the mixed face melts into the source
+    photo instead of showing a visible paste border.
+    """
     height, width = shape[:2]
     oval = points[list(FACE_OVAL_INDICES)].astype(np.float32)
     center = oval.mean(axis=0, keepdims=True)
-    expanded = center + (oval - center) * 1.12
+    expanded = center + (oval - center) * 1.08
     mask = np.zeros((height, width), np.uint8)
     cv2.fillConvexPoly(mask, np.round(expanded).astype(np.int32), 255)
-    sigma = max(1.0, min(height, width) * 0.008)
+    face_width = float(expanded[:, 0].max() - expanded[:, 0].min())
+    sigma = max(1.0, face_width * 0.10)
     soft = cv2.GaussianBlur(mask.astype(np.float32) / 255.0, (0, 0), sigma)
     return np.clip(soft, 0.0, 1.0)
+
+
+def _match_target_to_source_roi(
+    target: np.ndarray,
+    target_points: np.ndarray,
+    scale: float,
+    source_shape: tuple[int, ...],
+) -> tuple[np.ndarray, np.ndarray]:
+    """Resize the target image so its face ROI matches the source face ROI.
+
+    ``scale`` comes from :func:`_roi_scale_ratio` of the two face frames, so
+    it is the uniform, proportionate size ratio of the two ROIs. Resizing the
+    whole image with a quality interpolation keeps the later, near-rigid
+    placement warp sharp: without this step a much smaller target face would
+    be stretched into mush and a much larger one would waste resolution. When
+    a full-image resize would explode (a tiny face inside a huge photo), a
+    generous crop around the face ROI is resized instead so the intermediate
+    stays bounded. The landmarks are returned in the new pixel space.
+    """
+    if not np.isfinite(scale) or scale <= 0.0 or abs(scale - 1.0) < 1e-3:
+        return target, target_points
+
+    height, width = target.shape[:2]
+    projected_long_side = max(width, height) * scale
+    bound = max(4096, max(source_shape[:2]) * 2)
+
+    crop = None
+    if projected_long_side > bound:
+        # Tiny face in a huge photo: keep a generous region around the face
+        # but never so much context that the resized crop exceeds the bound.
+        roi_x0, roi_y0, roi_x1, roi_y1 = _face_roi(
+            target_points, target.shape, margin=0.0
+        )
+        roi_long_side = max(roi_x1 - roi_x0, roi_y1 - roi_y0)
+        margin = 1.0
+        if roi_long_side * scale * (1.0 + 2.0 * margin) > bound:
+            margin = max(0.1, (bound / (scale * roi_long_side) - 1.0) / 2.0)
+        crop = _face_roi(target_points, target.shape, margin=margin)
+
+    if crop is not None:
+        x0, y0, x1, y1 = crop
+        working = target[y0:y1, x0:x1]
+        points = target_points - np.array([x0, y0], np.float32)
+    else:
+        working, points = target, target_points
+
+    new_width = max(2, round(working.shape[1] * scale))
+    new_height = max(2, round(working.shape[0] * scale))
+    if abs(new_width - working.shape[1]) <= 1 and abs(new_height - working.shape[0]) <= 1:
+        return working, points
+
+    interpolation = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LANCZOS4
+    resized = cv2.resize(working, (new_width, new_height), interpolation=interpolation)
+    return resized, points * scale
+
+
+def _match_face_colors(
+    reference: np.ndarray, to_adjust: np.ndarray, points: np.ndarray
+) -> np.ndarray:
+    """Nudge the colours of ``to_adjust`` toward ``reference`` inside the face.
+
+    Both images must already be warped to the same face shape, so the same
+    oval covers comparable skin on each. Per-channel medians of that region
+    give a robust tone estimate; the gain is clipped so extreme differences
+    (glasses, heavy make-up, stage lighting) cannot blow the image out. This
+    is what keeps the mixed face from looking pasted onto the source.
+    """
+    height, width = reference.shape[:2]
+    oval = points[list(FACE_OVAL_INDICES)].astype(np.float32)
+    center = oval.mean(axis=0, keepdims=True)
+    inner = center + (oval - center) * 0.75
+    mask = np.zeros((height, width), np.uint8)
+    cv2.fillConvexPoly(mask, np.round(inner).astype(np.int32), 255)
+    if int(mask.sum()) == 0:
+        return to_adjust
+
+    gains: list[float] = []
+    for channel in range(3):
+        ref_median = float(np.median(reference[:, :, channel][mask > 0]))
+        adj_median = float(np.median(to_adjust[:, :, channel][mask > 0]))
+        if ref_median < 2.0 or adj_median < 2.0:
+            gains.append(1.0)
+            continue
+        gains.append(min(1.8, max(0.55, ref_median / adj_median)))
+
+    adjusted = to_adjust.astype(np.float32)
+    for channel, gain in enumerate(gains):
+        adjusted[:, :, channel] *= gain
+    return np.clip(adjusted, 0, 255).astype(np.uint8)
 
 
 def process_morph_image(
@@ -1623,17 +1939,42 @@ def process_morph_image(
     area: str,
     max_width: int,
     source_extension: str,
+    finder: str = MORPH_FINDER_MEDIAPIPE,
     progress: ProgressCallback | None = None,
 ) -> tuple[bytes, ProcessStats]:
-    """Morph the largest face in ``target_payload`` onto the source image.
+    """Mix the largest faces of the source and target into one blended face.
 
-    ``amount`` runs from 0 (source) to 1 (target). The two faces are aligned
-    with a similarity transform, the mesh is interpolated between their shapes,
-    and both images are warped to that intermediate shape with a piecewise
-    affine transform before cross-dissolving. ``area`` limits the blend to the
-    face or applies it to the whole aligned image.
+    ``amount`` runs from 0 (source) to 1 (target). The pipeline is:
+
+    1. Landmark the largest face of each image and determine its ROI in a
+       roll-normalised frame (a tilted head reports the same ROI as an
+       upright one).
+    2. Resize the whole target image with a single uniform, proportionate
+       scale so its face ROI matches the source face ROI in pixel size.
+    3. Place the resized target face *exactly* on the source face's
+       footprint — same size, position and tilt, anchored on the eye
+       midpoint — derived directly from the two ROIs, not fitted.
+    4. Warp both faces to the intermediate face shape with a Delaunay-
+       triangulated piecewise-affine warp and cross-dissolve them, with the
+       target's skin tone matched to the source.
+    5. Place that mixed face back on the source image inside a feathered
+       face oval, so the source background and framing are preserved.
+
+    ``area`` limits the blend to the face (default) or applies it to the
+    whole aligned image. ``finder`` picks how the face is located:
+    ``MORPH_FINDER_MEDIAPIPE`` (one pass) or ``MORPH_FINDER_YUNET`` (YuNet
+    locates the box first, which is more reliable for small faces).
     """
-    stats = ProcessStats(detector=DETECTOR_LANDMARKER, frames=1)
+    if finder not in (MORPH_FINDER_MEDIAPIPE, MORPH_FINDER_YUNET):
+        finder = MORPH_FINDER_MEDIAPIPE
+    stats = ProcessStats(
+        detector=(
+            f"{DETECTOR_YUNET} + {DETECTOR_LANDMARKER}"
+            if finder == MORPH_FINDER_YUNET
+            else DETECTOR_LANDMARKER
+        ),
+        frames=1,
+    )
     started = time.perf_counter()
     landmarker: FaceLandmarkerModel | None = None
 
@@ -1642,7 +1983,7 @@ def process_morph_image(
         if area not in (MORPH_FACE_ONLY, MORPH_WHOLE_IMAGE):
             area = MORPH_FACE_ONLY
 
-        landmarker = build_landmarker(progress)
+        landmarker = build_landmarker(progress, finder=finder)
 
         if progress is not None:
             progress(0.15, "Decoding images…")
@@ -1658,56 +1999,77 @@ def process_morph_image(
         target_points = landmarker.largest_face(target, "target")
         stats.faces = 2
 
+        # Roll-normalised ROI frame of each face. The proportionate resize
+        # factor and the exact placement transform both derive from these.
+        source_frame = _face_frame(source_points)
+        target_frame = _face_frame(target_points)
+        resize_factor = _roi_scale_ratio(source_frame, target_frame)
+        (_, _, source_roi_w, source_roi_h) = source_frame
+        (_, _, target_roi_w, target_roi_h) = target_frame
+
         if amount <= 1e-4:
             result = source.copy()
         else:
+            # Bring the target to the source's face resolution before any
+            # warping happens, so neither face is starved or blown up.
             if progress is not None:
-                progress(0.45, "Aligning the target face…")
-            aligned_target, aligned_target_points = _align_target(
+                progress(0.4, "Matching the target face ROI to the source…")
+            target, target_points = _match_target_to_source_roi(
+                target, target_points, resize_factor, source.shape
+            )
+
+            if progress is not None:
+                progress(0.5, "Placing the target face on the source face…")
+            aligned_target, aligned_points = _align_target(
                 target, target_points, source_points, source.shape
             )
             morph_points = (
-                (1.0 - amount) * source_points + amount * aligned_target_points
+                (1.0 - amount) * source_points + amount * aligned_points
             ).astype(np.float32)
 
             if progress is not None:
-                progress(0.55, "Warping faces…")
+                progress(0.6, "Warping faces…")
             if area == MORPH_FACE_ONLY:
                 source_all = np.vstack([source_points, _face_ring_points(source_points)])
-                target_all = np.vstack(
-                    [aligned_target_points, _face_ring_points(aligned_target_points)]
-                )
+                target_all = np.vstack([aligned_points, _face_ring_points(aligned_points)])
                 morph_all = np.vstack([morph_points, _face_ring_points(morph_points)])
-                triangles = _triangulate(morph_all)
-                warped_source = _warp_piecewise(
-                    source, source_all, morph_all, triangles
-                )
-                warped_target = _warp_piecewise(
-                    aligned_target, target_all, morph_all, triangles
-                )
             else:
                 boundary = _image_boundary_points(source.shape)
                 source_all = np.vstack([source_points, boundary])
-                target_all = np.vstack([aligned_target_points, boundary])
+                target_all = np.vstack([aligned_points, boundary])
                 morph_all = np.vstack([morph_points, boundary])
-                triangles = _triangulate(morph_all)
-                warped_source = _warp_piecewise(
-                    source, source_all, morph_all, triangles
-                )
-                warped_target = _warp_piecewise(
-                    aligned_target, target_all, morph_all, triangles
-                )
+            triangles = _triangulate(morph_all)
+            warped_source = _warp_piecewise(source, source_all, morph_all, triangles)
+            warped_target = _warp_piecewise(
+                aligned_target, target_all, morph_all, triangles
+            )
 
             if progress is not None:
                 progress(0.8, "Blending faces…")
-            blended = (
-                warped_source.astype(np.float32) * (1.0 - amount)
-                + warped_target.astype(np.float32) * amount
-            )
+            # Match the target's tone to the source inside the face region so
+            # the mixed face looks native to the source photo.
+            warped_target = _match_face_colors(warped_source, warped_target, morph_points)
+
             if area == MORPH_FACE_ONLY:
-                mask = _face_blend_mask(source.shape, morph_points)[:, :, None]
+                # Cross-dissolve the two warped faces into the mixed face.
+                # The target's share fades out with the mask, so none of the
+                # target's background leaks in around the face; then the mixed
+                # face is placed on the source image inside the feathered
+                # oval, leaving the source background and framing untouched.
+                mask = _face_blend_mask(source.shape, morph_points)
+                target_weight = mask * amount
+                mixed = (
+                    warped_source.astype(np.float32) * (1.0 - target_weight)[:, :, None]
+                    + warped_target.astype(np.float32) * target_weight[:, :, None]
+                )
                 blended = (
-                    source.astype(np.float32) * (1.0 - mask) + blended * mask
+                    source.astype(np.float32) * (1.0 - mask)[:, :, None]
+                    + mixed * mask[:, :, None]
+                )
+            else:
+                blended = (
+                    warped_source.astype(np.float32) * (1.0 - amount)
+                    + warped_target.astype(np.float32) * amount
                 )
             result = np.clip(blended, 0, 255).astype(np.uint8)
 
@@ -1718,7 +2080,11 @@ def process_morph_image(
         if not ok:
             raise RuntimeError(f"Could not encode the result as {encoder_label}.")
 
-        stats.morph = f"{area} · {round(amount * 100)}%"
+        stats.morph = (
+            f"{area} · {round(amount * 100)}% · target ROI "
+            f"{target_roi_w:.0f}×{target_roi_h:.0f} px resized ×{resize_factor:.2f} "
+            f"onto source ROI {source_roi_w:.0f}×{source_roi_h:.0f} px"
+        )
         stats.width = result.shape[1]
         stats.height = result.shape[0]
         stats.elapsed = time.perf_counter() - started
@@ -1817,6 +2183,19 @@ def _sidebar(kind: str) -> dict[str, object]:
                     "similar composition."
                 ),
             )
+            finder = st.radio(
+                "Face finder",
+                (MORPH_FINDER_MEDIAPIPE, MORPH_FINDER_YUNET),
+                help=(
+                    "How the face is located before morphing. MediaPipe "
+                    "FaceLandmarker finds the face and its 478-point mesh in one "
+                    "pass. YuNet first locates the face box and the mesh is then "
+                    "fitted on an optimally sized crop — more reliable when the "
+                    "face is small in the photo. Either way the mesh always "
+                    "comes from MediaPipe, and the other finder is tried as a "
+                    "fallback."
+                ),
+            )
 
             st.divider()
             st.header("Output")
@@ -1829,12 +2208,13 @@ def _sidebar(kind: str) -> dict[str, object]:
             st.divider()
             st.caption(
                 "100% local processing. No uploads to third-party services, no API keys. "
-                "Faces are matched with MediaPipe FaceLandmarker."
+                f"Faces are found with {finder}."
             )
             return {
                 "max_width": 0 if width_choice == "Original" else int(width_choice.split()[0]),
                 "morph_amount": amount / 100.0,
                 "morph_area": area,
+                "morph_finder": finder,
             }
 
         st.header("Detection")
@@ -2205,6 +2585,7 @@ def _run_morph(
             area=str(settings["morph_area"]),
             max_width=int(settings["max_width"]),
             source_extension=extension,
+            finder=str(settings["morph_finder"]),
             progress=report,
         )
 
@@ -2355,12 +2736,23 @@ def _morph_route(settings: dict[str, object]) -> None:
         with st.expander("How face morphing works"):
             st.markdown(
                 """
-- MediaPipe **FaceLandmarker** finds the largest face in each photo and
-  returns a 478-point mesh. The model is downloaded once and cached locally.
-- The target face is aligned onto the source face with a similarity transform
-  (scale, rotation, translation), so different photo sizes and small tilts work.
+- The face in each photo is located with the chosen **finder** — MediaPipe
+  FaceLandmarker in one pass, or YuNet first when the face is small in its
+  photo — and a 478-point mesh is fitted. Models are downloaded once and
+  cached locally.
+- The face **ROI** is determined in both photos in a roll-normalised frame,
+  so a tilted head reports the same ROI as an upright one. The whole target
+  image is then resized with a single uniform, proportionate scale so its
+  face ROI matches the source's in pixel size.
+- The resized target face is placed **exactly** on the source face's
+  footprint — same size, position and tilt, anchored on the eye midpoint —
+  derived directly from the two ROIs rather than fitted to landmarks, so the
+  morph stays proportionate at every amount.
 - Both faces are warped to an in-between shape with a Delaunay-triangulated
-  piecewise affine warp, then cross-dissolved.
+  piecewise affine warp, then cross-dissolved into one **mixed face**. The
+  target's skin tone is matched to the source so it does not look pasted.
+- The mixed face is placed back on the **source image** inside a softly
+  feathered face oval — the source background and framing stay untouched.
 - **Morph amount** blends from the source (0%) to the target (100%).
 - **Face only** keeps the source background. **Whole image** also blends the
   aligned target background, which works best with similar compositions.
@@ -2384,7 +2776,8 @@ def _morph_route(settings: dict[str, object]) -> None:
     with options_left:
         st.write(
             f"**Morph amount:** {round(float(settings['morph_amount']) * 100)}% · "
-            f"**Blend area:** {settings['morph_area']}"
+            f"**Blend area:** {settings['morph_area']} · "
+            f"**Finder:** {settings['morph_finder']}"
         )
     with options_right:
         start = st.button("Morph faces", type="primary", key="morph_faces")
