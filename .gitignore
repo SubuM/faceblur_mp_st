@@ -3,6 +3,9 @@ __pycache__/
 *.py[cod]
 *$py.class
 
+# Model files downloaded on first run by the app (YuNet, MediaPipe)
+models/
+
 # C extensions
 *.so
 
