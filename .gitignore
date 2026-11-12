@@ -130,7 +130,7 @@ celerybeat.pid
 # SageMath parsed files
 *.sage.py
 
-# Environments
+# Environments and secrets
 .env
 .venv
 env/
@@ -138,6 +138,11 @@ venv/
 ENV/
 env.bak/
 venv.bak/
+.env.*
+!.env.example
+.venv.*
+.venv/
+.streamlit/secrets.toml
 
 # Spyder project settings
 .spyderproject

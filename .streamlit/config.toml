@@ -1,0 +1,4 @@
+# Allow large video uploads (Streamlit defaults to 200 MB).
+# FaceBlur Studio needs to accept multi-hundred-MB video files for processing.
+[server]
+maxUploadSize = 2000
